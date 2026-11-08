@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# gatchnnect - Snap plug connection guard
+# -*- coding: UTF-8 -*-
+
+set -uo pipefail
+
+# ====== CONFIGURATION ======
+SNAP_APP="${SNAP_NAME:-}"
+
+# Space-separated list of plugs that must be connected.
+# Leave empty to disable the guard entirely.
+# Example: REQUIRED_PLUGS="joystick removable-media"
+REQUIRED_PLUGS=""
+# ==========================
+
+BACKEND=""
+
+detect_backend() {
+    if command -v kdialog >/dev/null 2>&1; then
+        echo "kdialog"
+    elif command -v zenity >/dev/null 2>&1; then
+        echo "zenity"
+    elif command -v yad >/dev/null 2>&1; then
+        echo "yad"
+    else
+        echo "terminal"
+    fi
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --kdialog)  BACKEND="kdialog";  shift ;;
+        --zenity)   BACKEND="zenity";   shift ;;
+        --yad)      BACKEND="yad";      shift ;;
+        --terminal) BACKEND="terminal"; shift ;;
+        -h|--help)  exit 0 ;;
+        --) shift; break ;;
+        *)  break ;;
+    esac
+done
+
+if [ -z "$BACKEND" ]; then
+    BACKEND=$(detect_backend)
+fi
+
+case "$BACKEND" in
+    kdialog|zenity|yad)
+        if ! command -v "$BACKEND" >/dev/null 2>&1; then
+            echo "Backend '$BACKEND' not found in PATH." >&2
+            exit 1
+        fi
+        ;;
+    terminal) : ;;
+    *)
+        echo "Invalid backend: $BACKEND" >&2
+        exit 1
+        ;;
+esac
+
+if [ -z "$SNAP_APP" ]; then
+    echo "Error: SNAP_NAME is not set. This script must run inside a snap." >&2
+    exit 1
+fi
+
+if [ -z "$REQUIRED_PLUGS" ]; then
+    exec "$@"
+fi
+
+LANG_CODE="${LC_ALL:-${LANG:-en}}"
+LANG_CODE="${LANG_CODE%%.*}"
+LANG_CODE="${LANG_CODE%%@*}"
+LANG_CODE="${LANG_CODE:0:2}"
+case "$LANG_CODE" in
+    pt|en|es) ;;
+    *) LANG_CODE="en" ;;
+esac
+
+msg() {
+    local k="$1"
+    case "${LANG_CODE}_${k}" in
+        en_title)  echo "Additional permissions required" ;;
+        en_text)   echo "The app <b>%s</b> needs the following plugs connected:\n\n%s\n\nA shortcut has been created on your Desktop. Open it, authenticate with your password, and the app will start." ;;
+        en_shortcut_ok) echo "Shortcut created:\n%s" ;;
+
+        pt_title)  echo "Permissões adicionais necessárias" ;;
+        pt_text)   echo "O app <b>%s</b> precisa dos seguintes plugs conectados:\n\n%s\n\nUm atalho foi criado na sua Área de Trabalho. Abra-o, autentique com sua senha e o app iniciará." ;;
+        pt_shortcut_ok) echo "Atalho criado:\n%s" ;;
+
+        es_title)  echo "Permisos adicionales requeridos" ;;
+        es_text)   echo "La app <b>%s</b> necesita los siguientes plugs conectados:\n\n%s\n\nSe creó un acceso directo en tu Escritorio. Ábrelo, autentícate con tu contraseña y la app se iniciará." ;;
+        es_shortcut_ok) echo "Acceso creado:\n%s" ;;
+    esac
+}
+
+notify() {
+    local title="$1"
+    local message="$2"
+
+    case "$BACKEND" in
+        kdialog)  kdialog --title "$title" --msgbox "$message" 2>/dev/null || true ;;
+        zenity)   zenity --info --title="$title" --text="$message" --width=520 2>/dev/null || true ;;
+        yad)      yad --info --title="$title" --text="$message" --width=520 --button="OK:0" 2>/dev/null || true ;;
+        terminal) printf '[%s] %s\n' "$title" "$message" >&2 ;;
+    esac
+}
+
+get_desktop_dir() {
+    local real_home="${SNAP_REAL_HOME:-$HOME}"
+    local desktop="$real_home/Desktop"
+    local config="$real_home/.config/user-dirs.dirs"
+    if [ -f "$config" ]; then
+        local xdg
+        xdg=$(grep "^XDG_DESKTOP_DIR=" "$config" | cut -d'=' -f2- | tr -d '"')
+        [ -n "$xdg" ] && desktop="${xdg/#\$HOME/$real_home}"
+    fi
+    echo "$desktop"
+}
+
+is_plug_connected() {
+    local plug="$1"
+
+    if command -v snapctl >/dev/null 2>&1; then
+        snapctl is-connected "$plug" >/dev/null 2>&1
+        return $?
+    fi
+
+    if command -v snap >/dev/null 2>&1; then
+        local slot
+        slot=$(snap connections "$SNAP_APP" 2>/dev/null \
+               | awk -v p="$plug" '$1 == p { print $3; exit }')
+        [ -n "$slot" ] && [ "$slot" != "-" ]
+        return $?
+    fi
+
+    return 1
+}
+
+desktop_dir=$(get_desktop_dir)
+shortcut_path="$desktop_dir/gatchnnect-$SNAP_APP.desktop"
+
+common_dir="${SNAP_USER_COMMON:-$HOME/snap/$SNAP_APP/common}"
+mkdir -p -- "$common_dir"
+helper_path="$common_dir/gatchnnect-connect.sh"
+
+missing=()
+for plug in $REQUIRED_PLUGS; do
+    if ! is_plug_connected "$plug"; then
+        missing+=("$plug")
+    fi
+done
+
+if [ ${#missing[@]} -eq 0 ]; then
+    rm -f -- "$shortcut_path" "$helper_path"
+    exec "$@"
+fi
+
+connect_chain=""
+for plug in "${missing[@]}"; do
+    if [ -n "$connect_chain" ]; then
+        connect_chain="$connect_chain && "
+    fi
+    connect_chain="${connect_chain}snap connect ${SNAP_APP}:${plug}"
+done
+
+cat > "$helper_path" << EOF
+#!/bin/sh
+pkexec /bin/sh -c '$connect_chain' || exit 1
+exec snap run ${SNAP_APP}
+EOF
+chmod 755 "$helper_path"
+
+cat > "$shortcut_path" << EOF
+[Desktop Entry]
+Name=Grant permissions for $SNAP_APP
+Comment=Connect the required plugs and start $SNAP_APP
+Exec=$helper_path
+Icon=$SNAP_APP
+Terminal=true
+Type=Application
+Categories=Utility;
+StartupNotify=false
+EOF
+chmod +x "$shortcut_path"
+
+missing_list=""
+for plug in "${missing[@]}"; do
+    missing_list="${missing_list}• ${plug}\n"
+done
+missing_list="${missing_list%\\n}"
+
+notify "$(msg title)" "$(printf "$(msg text)" "$SNAP_APP" "$missing_list")"
+
+exit 1
