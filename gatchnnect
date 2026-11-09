@@ -174,7 +174,7 @@ cat > "$shortcut_path" << EOF
 Name=Grant permissions for $SNAP_APP
 Comment=Connect the required plugs and start $SNAP_APP
 Exec=$helper_path
-Icon=$SNAP_APP
+Icon=/snap/$SNAP_APP/current/meta/gui/icon
 Terminal=true
 Type=Application
 Categories=Utility;
